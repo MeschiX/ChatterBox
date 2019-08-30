@@ -1,0 +1,290 @@
+/**
+ * @mainpage Documentazione del software ChatterBox
+ *
+ * @section sec1 Descrizione
+ * Questa è la pagina di documentazione del progetto **ChatterBox** relativo al corso di sistemi operativi A.A. 2017/2018 \n
+ * Nelle seguenti sezioni verrano spiegate le diverse scelte implementative prese durante la stesura del programma e il
+ * funzionamento delle diverse operazioni che vengono svolte durante l'esecuzione.
+ *
+ * @section sec2 Specifiche
+ * Lo svolgimento del progetto consiste nella stesura di un programma in @c C che deve implementare un server di chat.
+ * Insieme alle specifiche del progetto è stato consegnato il programma client mandatorio, una traccia di Makefile e alcuni scripts di test.
+ * Le operazioni di cui si chiede l'implementazione sono quelle che ci si aspetta da un seplice servizio di chat, ossia:
+ *  - Registrazione di un utente alla chat
+ *  - LogIn dell'utente alla chat
+ *  - Richiesta della lista degli utentu online
+ *  - Invio di un messaggio testuale ad uno specifico utente
+ *  - Invio di un file ad uno specifico utente
+ *  - Invio di un messaggio testuale a tutti gli utente registrati
+ *  - Creazione di un gruppo di utenti
+ *  - Adesione ad un gruppo
+ *  - Invio di un messaggio testuale ad un gruppo
+ *  - Invio di un file ad un gruppo
+ *  - Dissociazione da un gruppo
+ *  - Cancellazzione di un gruppo
+ *  - Richiesta degli ultimi messaggi ricevuti
+ *  - Deregistrazione dell'utente dalla chat
+ *
+ * Secondo le specifiche il server deve essere eseguito con l'opzione @c -f seguita dal path di un file di configurazione, quindi per esempio:
+ * @code ./chatty -f ./DATA/chatty.conf1 @endcode
+ * Le specifiche di formattazione e i diversi valori di impostazione determinati dal file di configurazione sono descritti nella documentazione relativa al file @ref settings.h \n
+ * Il server deve gestire le connessioni e il servizio delle richieste da connessioni già stabilite in modo concorrente e deve inoltre essere in grado di gestire efficentemente alcune
+ * centinaia di connessioni e alcune migliaia di utenti registrati.
+ * Il numero di threads che gestiscono le connessioni è determinato dall'opzione @c TreadsInPool (@ref ThreadsInPool), ogni thread gestirà una sola richiesta per volta, al termine
+ * dell'elaborazione di suddetta richiesta il thread controllerà la presenza di altre richieste pendenti, in caso affermativo comincia di nuovo la gestione della nuova
+ * richiesta altrimenti si mette in attesa.
+ * Il server dovrà poter essere terminato correttamente in ogni momento lanciando un segnale fra @c SIGINT , @c SIGTERM o @c SIGQUIT .
+ *
+ * @section sec3 Relazione sul codice prodotto
+ * @subsection subSec1 Strutture dati utilizzate
+ * In questo progetto le principali strutture dati sono:
+ *  - @ref incomeList \n
+      Rappresenta la linea di comunicazione fra il main thread che percepisce richieste sui file descriptors e i worker threads
+      i quali estraggono il valore del file descriptor dalla coda e cominciano il servizio della richiesta.
+      E' implementata come una lista concatenata concorrente di elementi @ref income .
+    - @ref user \n
+      Struttura che rappresenta un singolo utente all'interno del sistema.
+      Si tratta di una semplice struttura che raccoglie le informazioni dell'utente fra cui:
+         - @ref delivery \n
+           Rappresenta il vettore di connessioni al singolo utente (@ref delivery.h).
+           La lunghezza di tale vettore e quindi il numero massimo di connessioni simultanee per utente è regolata
+           dalla macro @ref MAX_USER_SIMULTANEUS_CONNECTIONS .
+         - @ref membership \n
+           Rappresenta il vettore di appartenenza del singolo utente (@ref membership.h).
+           La lunghezza del vettore e quindi il numero massimo di gruppi a cui un utente può appartenere simultaneamente è
+           regolata dalla macro @ref MAX_USER_SIMULTANEUS_GROUPS
+         - @ref history \n
+           Rappresenta il vettore degli ultimi messaggi ricevuti dall'utente (@ref history).
+           La lunghezza del vettore e quindi il numero massimo di messaggi contenibili nella history è determinata dal valore
+           di impostazione @ref MaxHistMsgs
+    - @ref usersTable \n
+      Rappresenta la tabella dove si tiene traccia di tutti gli utenti registrati, memmorizzandoli assieme alle loro informazioni
+      e strutture relative.
+      E' implementata come una hash table concorrente con code di trabocco, più nello specifico consiste di un
+      vettore di @ref usersList (le quali rappresentano le code di trabocco); La concorrenza invece è gestita tramite un vettore di
+      locks ognuna delle quali è relativa ad una certa porzione di tabella. \n
+      Il numero di righe della tabella è regolato dalla macro @ref USERS_TABLE_SIZE e la dimensione dei blocchi
+      di mutua esclusione è regolata da @ref USERS_MUTEX_BLOCK_SIZE
+    - @ref logsTable \n
+      Rappresenta la tabella dove si tiene traccia di tutte le istanze di logIn al sistema da parte di utenti registrati.
+      E' implementata come una tabella hash concorrente con hashing diretto, infatti l'accesso alla tabella viene effettuato attraverso
+      il valore del file descriptor del socket sul quale avviene la comunicazione con il clicent. La concorrenza è gestita tramite
+      una lock per ogni slot della tabella (per le scritture e le letture dal socket) e una lock aggiuntiva per rendere
+      le operazioni di login e logout mutuamente esclusive. \n
+      Il numero di slots della tabella è uguale a: il numero massimo di connessioni contemporanee al server (@ref MaxConnections) +
+      il numero di threads nel pool (@ref ThreadsInPool) + 1.
+      Questa quantità è dovuta all'assegnazione dei valori dei file descriptors effettuata dal sistema.
+      Per ulteriori chiarimenti vedere la documentazione di @ref logIn.h
+    - @ref groupsTable \n
+      Rappresenta la tabella dove si tiene traccia di tutti i gruppi registrati nel sistema dagli utenti. Nella struttura ogni gruppo
+      viene accompagnato dalla lista dei suoi membri e altre informazioni di base.
+      L'implementazione della tabella dei gruppi rispecchia completamente la struttura della tabella degli utenti.
+      Il numero di righe della tabella è regolato dalla macro @ref GROUPS_TABLE_SIZE e la dimensione dei blocchi
+      di mutua esclusione è regolata da @ref GROUPS_MUTEX_BLOCK_SIZE
+    - @ref fdSet \n
+      Rappresenta la struttura che raccoglie l'insieme dei file descriptors da monitorare e altre informazioni per permettere
+      la corretta gestione delle strutture utili alla system call @c select() .
+ *
+ *
+ * @subsection subSec2 Suddivisione del codice
+ * Il codice prodotto è stato suddiviso in modo tale da essere modulare. Nello specifico il codice delle funzoni relative alle
+ * strutture dati è stato suddiviso su diversi files: uno per struttura dati principale.
+ * Inoltre la maggior parte delle definizioni di macro sono raccolte in @ref config.h , le funzioni di utilità sono invece raccolte
+ * in @ref utils.h , le funzioni che estraggono le impostazioni di sistema e ne stampano i valori sono raccolte in @ref settings.h ,
+ * le funzioni che implementano il protocollo di comunicazione parte client sono raccolte in @ref connections.h mentre quelle parte
+ * server sono raccolte in @ref communication.h insieme ad altre funzioni che svolgono operazioni comunicando con i clients, infine
+ * la funzione di routine dei threads worker è raccolta nel file @ref listener.h .
+ * Durante l'esecuzione del Makefile viene generata una libreria statica @c libchatty.a che contiene il codice compilato di
+ * tutte le funzioni menzionate sopra.
+ *
+ * @subsection subSec6 Flusso di esecuzione
+ * Il programma server inizia la sua esecuzione dalla funzione @c main definita all'interno del file @ref chatty.c , durante la sua
+ * esecuzione attiva un pool di tread che eseguono tutti la solita funzione di routine (@ref listener).
+ * Analizziamo il loro flusso di esecuzione separatamente.
+ * @subsubsection subSubSec1 Thread main
+ * Inizialimente si effettua il parsing dei parametri passati da riga di comando, controllando che non ci siano opzioni incomplete
+ * o sconosciute, dopodiché si procede con il parsing del file di configurazione e quindi con l'impostazione dei valori di setting
+ * del server (@ref settings.h).
+ * A questo punto vengono inizializzate in quest'ordine le principali strutture dati del programma:
+ *   - @ref incomeList
+ *   - @ref usersTable
+ *   - @ref logsTable
+ *   - @ref groupsTable
+ *
+ * Vengono rimossi eventuali files residui da vecchie esecuzioni del programma e subito creati il nuovo file delle statistiche
+ * e la directory per il salvataggio dei files scambiati.
+ * Viene impostata la gestione dei segnali e vengono inizializzati i parametri dei threads.
+ * A questo punto vengono lanciati i vari threads worker.
+ * Viene creato il socket per la connessione di client dopodiché inizia il **ciclo di ascolto** del server.
+ * In questo ciclo il server controlla inizialmente i flag di terminazione e di ricezione del segnale SIGUSR1:
+ *   - Se il flag di terminazione è @c true allora si esce dal ciclo, inserisce il messaggio di terminazione nella @ref incomeList ,
+ *     attende la terminazione dei threads e chiama una per una le funzioni di pulzia della memoria per ogni struttura dati
+ *     precedentemente inizializzata. **Qui il programma termina**.
+ *   - Se il flag di ricezione del segnale @c SIGUSR1 è @c true allora vengono appesi i valori delle statistiche attuali
+ *     al file delle statistiche. Si prosegue nel ciclo.
+ *
+ * Si crea una copia del set di files descriptor di sistema (@ref masterSet) che viene passata alla system call  @c select() al termine
+ * della quale vengono esaminati i files descriptor residenti nell'insieme per vedere se c'è una nuova connessione pendente o
+ * se è possibile effettuare una lettura da una connessione già stabilita:
+ *   - Se viene rilevata un anuova connessione pendente questa viene accettata, l'accettazione restituisce il valore di un
+ *     file descriptor che viene inserito nell'insieme dei files descriptor da monitorare (@ref masterSet)
+ *   - Se viene rilevata una possibile scrittura da una connessione già stabilita viene rimosso il file descriptor corrispondente
+ *     dall'insieme di file descriptors da monitorare (@ref masterSet) e viene inserito nella lista di comunicazione con i threads
+ *     (@ref incomeList).
+ *
+ * Il ciclo ricomincia.
+ *
+ * @subsubsection subSubSec2 Thread listener
+ * La funzione @ref listener inizia eseguento subito un ciclo potenzialmente infinito nel quale si porcede
+ * estraendo un file descriptor da servire dalla @ref incomeList di sistema (@ref service) attraverso la chiamata alla
+ * funzione popIncome().
+ * Effettuata l'estazione si controlla se il valore restituito:
+ *  - Se è il valore di terminazione (@ref INCOME_LIST_TERM) il ciclo viene interrotto. **Qui la funzione listener() termina**.
+ *  - Se è il valore di un semplice file descriptor allora la funzione comincia ad interagire con il client connesso al server
+ *    attraverso file descriptor estratto.
+ *
+ * Inizialmente si legge il messaggio di richiesta del client attraverso la funzione sReadMsg():
+ *  - Se viene restituito un valore minore di zero allora si procede con l'operazione di logout e poi disconnessione qualora il
+ *    client da cui si leggeva fosse stato loggato, altrimenti direttamente con la disconnessione qualora il client da cui si
+ *    leggeva o non era registrato o non aveva eseguito il login. In entrambi questi casi **qui il cliclo ricomincia**.
+ *  - Se viene restituito un valore maggiore di 0 (sperabilmente la dimensione del messaggio) viene analizzato per casi il tipo
+ *    di messaggio in base al campo @c op di @ref message_hdr_t
+ *
+ * A questo punto si analizza il messaggio letto per casi
+ *  - @ref REGISTER_OP \n
+ *    Consiste nella richiesta di registrazione, viene chiamata la funzione registerUser().
+ *    Se la funzione fallisce per qualche motivo (vedere la documentazione di @ref registerUser) si invia un messaggio di
+ *    operazione fallita al client, altrimenti **si passa al caso successivo**.
+ *  - @ref CONNECT_OP \n
+ *    Consiste nella richiesta di logIn, viene chiamata la funzione logInUser().
+ *    Se la funzione fallisce per qualche motivo (vedere la documentazione di @ref logInUser) si invia un messaggio di
+ *    operazione fallita al client, altrimenti **si passa al caso successivo**.
+ *  - @ref USRLIST_OP \n
+ *    Consiste nella richiesta della lista degli utenti loggati al sistema, viene chiamata la funzione getLoggedUsersList() per
+ *    generare la lista dopodiché viene inviata al client con un messaggio di operazione avvenuta con successo (@ref OP_OK).
+ *    **Qui l'analisi dei casi si interrompe**.
+ *  - @ref POSTTXTALL_OP e @ref POSTTXT_OP \n
+ *    Consiste nella richiesta di invio di un messaggio di tipo testo da un utente ad un altro utente oppure ad un gruppo di utenti
+ *    oppure a tutti gli utenti registrati.
+ *    Anche se le tre operazioni sono chiaramente distinte, queste rientrano nel solito caso all'interno di questa analisi
+ *    poiché la discriminazione del destinatario/i verrà fatta all'interno della funzione di invio del messaggio.
+ *    Per prima cosa viene verificato se il mittente è effettivamente registrato (in caso negativo viene inviato un messaggio
+ *    di fallimento dell'operazione e **qui l'analisi dei casi si interrompe**).
+ *    A questo punto viene invocata la funzione ship():
+ *        - Se la funzione fallisce per qualche motivo (vedere la documentazione di @ref ship
+ *          allora viene inviato un opportuno messaggio di errore al mittente (@ref OP_NICK_UNKNOWN o @ref OP_MSG_TOOLONG
+ *          o @ref OP_FAIL a seconda dei casi) e **qui l'analisi dei casi si interrompe**.
+ *        - Se l'invio è avvenuto con successo allora viene inviato al mittente un messaggio di operazione avvenuta
+ *          con successo (@ref OP_OK) e **qui l'analisi dei casi si interrompe**.
+ *  - @ref GETPREVMSGS_OP \n
+ *    Consiste nella richiesta dello storico dei messaggi da parte di un utente, viene chiamata la funzione sendUserHistory()
+ *    che invia uno per uno tutti i messaggi presenti nello storico dell'utente che ne ha fatto richiesta.
+ *    Se la funzione fallisce per qualche motivo (vedere la documentazione di sendUserHistory()) allora viene inviato un messaggio
+ *    di operazione fallita.
+ *    In ogni caso **qui l'analisi dei casi si interrompe**.
+ *  - @ref UNREGISTER_OP \n
+ *    Consiste nella richiesta di deregistrazione da parte di un utente, viene chiamata la funzione unregisterUser(). Se la funzione
+ *    fallisce allora viene inviato un messaggio di fallimento dell'operzaione al client che l'ha richiesta, in caso di successo
+ *    invece viene inviato un messaggio di operazione avvenuta con successo.
+ *    In ogni caso **qui l'analisi dei casi si interrompe**.
+ *  - @ref POSTFILE_OP \n
+ *    Consiste nella richiesta di invio di un file da un utente ad un altro utente oppure ad un gruppo di utenti.
+ *    Per prima cosa viene verificato se il mittente è effettivamente registrato (in caso negativo viene inviato un messaggio
+ *    di fallimento dell'operazione e **qui l'analisi dei casi si interrompe**.
+ *    Viene estratto il nome del file dal path (@ref getNameFromPath) presente nel messaggio di richiesta, dopodiché viene composto
+ *    il path della copia del file che dovrà risiedere nella cartella dei file scambiati (@ref DirName).
+ *    A questo punto avviene il trasferimento del file che viene letto dal server tramite la funzione sReadFile().
+ *    Se avviene un errore durante la lettura viene inviato un opportuno messaggio di errore al client che ha inoltrato la richiesta
+ *    e **qui l'analisi dei casi si interrompe**.
+ *    Se invece la lettura avviene correttamente, si verifica subito se il file è già presente nella cartella @ref DirName :
+ *        - Se il file è già presente allora quello appena letto viene scartato.
+ *        - Se invece non è già presente viene creato il file e scritto con i dati appena letti.
+ *
+ *    A questo punto viene prearato un messaggio di notifica per il destinatario/i e inviato tramite la funzione ship().
+ *    Viene verificato il successo della funzione come nel caso di @ref POSTTXT_OP e @ref POSTTXTALL_OP .
+ *    Viene libaerata la memoria occupata dai vari buffers e **qui l'analisi dei casi si interrompe**.
+ *  - @ref GETFILE_OP \n
+ *    Consiste nella richiesta di download di un file da parte di un utente.
+  *    Per prima cosa viene verificato se il mittente è effettivamente registrato (in caso negativo viene inviato un messaggio
+ *    di fallimento dell'operazione e **il ciclo ricomincia da capo**).
+ *    Viene composto il path del file che, se esiste, risiede in @ref DirName .
+ *        - Se il file non esiste viene inviato un messaggio di errore al mittente
+ *          (@ref OP_NO_SUCH_FILE) e **qui l'analisi dei casi si interrompe**.
+ *        - Se invece il file esiste questo viene aperto, mappato in memoria e inviato
+ *          al client tramite un messaggio di operazione avvenuta con successo (@ref OP_OK).
+ *          **qui l'analisi dei casi si interrompe**.
+ *  - @ref CREATEGROUP_OP \n
+ *    Consiste nella richiesta di creazione di un nuovo gruppo.
+ *    Inizialmente viene invocata la funzione createGroup() per l'aggiunta del gruppo
+ *    alla tabella dei gruppi di sistema (@ref grTable).
+ *    Se la funzione fallisce viene inviato un opportuno messaggio di errore
+ *    (@ref OP_NICK_ALREADY o @ref OP_FAIL) e **qui l'analisi dei casi si interrompe**.
+ *    Altrimenti l'utente che ha inoltrato la richiesta viene aggiunto al gruppo
+ *    tramite la funzione joinUser().
+ *    Ugualmente qui se la funzione fallisce viene inviato un opportuno messaggio di errore
+ *    (@ref OP_FAIL) e **qui l'analisi dei casi si interrompe**.
+ *  - @ref ADDGROUP_OP \n
+ *    Consiste nella richiesta di adesione ad un gruppo da parte di un utente.
+ *    Viene chiamata la funzione joinUser() se la funzione fallisce viene inviato
+ *    un opportuno messaggio di errore (@ref OP_NICK_UNKNOWN o @ref OP_FAIL) e
+ *    **qui l'analisi dei casi si interrompe**.
+ *    Se la funzione ha avuto successo viene inviato un messaggio di operazione avvenuta
+ *    (@ref OP_OK) e **qui l'analisi dei casi si interrompe**.
+ *  - @ref DELGROUP_OP \n
+ *    Consiste nella richiesta di dissociazione da un gruppo da parte di un utente.
+ *    Viene chiamata la funzione disjoinUser() se la funzione fallisce viene inviato
+ *    un opportuno messaggio di errore (@ref OP_NICK_UNKNOWN) e
+ *    **qui l'analisi dei casi si interrompe**.
+ *    Se la funzione ha avuto successo viene inviato un messaggio di operazione avvenuta
+ *    (@ref OP_OK) e **qui l'analisi dei casi si interrompe**.
+ *  - @ref REMOVEGROUP_OP \n
+ *    Consiste nella richiesta di cancellazione di un gruppo.
+ *    Viene chiamata la funzione deleteGroup(), se la funzione fallisce viene inviato un
+ *    messaggio di errore al client che ha inoltrato la richiesta (@ref OP_NICK_UNKNOWN)
+ *    e **qui l'analisi dei casi si interrompe**.
+ *    Altrimenti viene inviato un messaggio di oprazione avvenuta con successo (@ref OP_OK)
+ *    e **qui l'analisi dei casi si interrompe**.
+ *
+ * A questo punto viene liberata la memoria occupata dalle varie strutture allocate
+ * durante l'esecuzione delle operazioni dopodiché il file descriptor viene reinserito nel
+ * set (@ref masterSet). **Qui il ciclo ricomincia**.
+ *
+ * @subsection subSec3 Estensioni
+ * @subsubsection subSubSec3 Gestione errori
+ * Relativamente alla gestione degli errori, all'interno del programma è stato assunto un modello di restiruzione di valori
+ * da parte delle funzioni per indurre coerenza in tutte le sue singole parti. \n
+ * I valori di ritorno delle funzioni, che sono sempre interi, vanno interpretati come segue:
+ *  - @c >=0 Se l'esecuzione della funzione è avvenuta con successo
+ *  - @c -1 Se si è verificato un errore fatale
+ *  - @c <-1 Se si è verificato un errore non fatale
+ *
+ * All'interno del file @ref errors.h sono elencati tutti i codici di errore interni e relativi ad ogni possibile causa di
+ * Inadempienza delle funzioni.
+ * Relativamente ai codici di errore sono anche elencati, uno per uno, tutti i possibili messaggi di errore.
+ * Tutto questo per avere una coerenza di valutazione dell'errore al ritorno delle funzioni, inoltre in questo modo si facilita
+ * la gestione dell'errore e la stampa dei messaggi di errore.
+ *
+ * @subsubsection subSubSec4 LogIn simultanei
+ * All'interno del progetto si è gestito nel modo ritenuto più corretto lo scenario di più client loggati al servizio
+ * con lo stesso username, questo giustifica la presenza della struttura @ref delivery all'interno
+ * della struttura @ref user .
+ * Innanzitutto si è dato un limite al numero di client loggati al solito utente, definito dalla
+ * macro @ref MAX_USER_SIMULTANEUS_CONNECTIONS.
+ * In generale la gestione di questo fatto funziona come ci si aspetta: se un messaggio viene inviato ad un utente con più clients
+ * loggati, allora la notifica di messaggio arriverà a tutti i clients, se un client richiede lo storico dei messaggi questo verrà
+ * inviato solo a lui e non a tutti gli altri client loggati con il solito utente, ecc... \n
+ * La parte più delicata risiede nella desregistrazione dell'utente che ha più client loggati, per cui si è deciso di disconnettere
+ * (brutalmente) tutti i clients tranne quello che ha fatto richiesta di deregistrazione, il quale deve ricevere il messaggio
+ * di operazione avvenuta, fatto ciò si procede come una normale disconnessione del client rimasto. \n
+ * Per maggiori dettagli leggere la documentazione di @ref delivery.h .
+ *
+ * @subsubsection subSubSec5 Stampa di messaggi colorati su terminale
+ * Per ottenere una lettura veloce ed efficace dei messaggi di output su terminale da parte del server, è stato implementato
+ * all'interno del progetto un sistema di stampa formattata che si basa sul concatenamento di alcune stringhe all'inizio e alla fine
+ * del messaggio che si intende stapare. I codici di formattazione e le descrizione delle funzioni di stampa sono reperibili
+ * nella documentazione del file @ref utils.h .
+ * Questa funzionalità non è completamente portabile e il suo comportamento può variare fra i diversi emulatori di terinale, è stata
+ * quindi resa una funzione impostabile tramite ozione (@c -c ) da terminale:
+ * @code ./chatty -f ./DATA/chatty.conf1 -c @endcode
+ *
+ */
